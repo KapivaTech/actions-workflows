@@ -4,138 +4,57 @@ on:
   workflow_call:
     secrets:
       SLACK_WEBHOOK_URL:
-        description: 'Slack webhook for posting metrics'
         required: true
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
-  collect-metrics:
+  metrics:
     runs-on: ubuntu-latest
-    
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       
-      - name: Install dependencies
-        run: pip install requests
+      - run: pip install requests
       
       - name: Collect and post metrics
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           REPO_OWNER: ${{ github.repository_owner }}
           REPO_NAME: ${{ github.event.repository.name }}
-        run: python3 << 'EOFPYTHON'
-import json
-import os
-import subprocess
-import requests
-from datetime import datetime, timedelta
-
-try:
-    # Get environment variables
-    webhook_url = os.getenv('SLACK_WEBHOOK_URL')
-    repo_owner = os.getenv('REPO_OWNER')
-    repo_name = os.getenv('REPO_NAME')
-    
-    if not webhook_url:
-        print("⚠️ SLACK_WEBHOOK_URL not set")
-        exit(0)
-    
-    # Count co-authored commits (last 7 days)
-    result = subprocess.run(
-        ['git', 'log', '--all', '--since=7 days ago', '--format=%B'],
-        capture_output=True, text=True, cwd='.'
-    )
-    co_authored_count = result.stdout.count('Co-authored-by: Claude')
-    
-    # Count total commits (last 7 days)
-    result = subprocess.run(
-        ['git', 'log', '--all', '--since=7 days ago', '--oneline'],
-        capture_output=True, text=True, cwd='.'
-    )
-    total_commits = len([line for line in result.stdout.strip().split('\n') if line])
-    
-    # Calculate percentage
-    if total_commits == 0:
-        co_authored_percent = 0.0
-    else:
-        co_authored_percent = round((co_authored_count * 100) / total_commits, 1)
-    
-    # Date range
-    week_of = f"{(datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')} to {datetime.now().strftime('%Y-%m-%d')}"
-    
-    # Determine status
-    if co_authored_percent >= 20:
-        color = "good"
-        status = "🎯 Excellent"
-    elif co_authored_percent >= 10:
-        color = "warning"
-        status = "📈 Good"
-    else:
-        color = "danger"
-        status = "⚠️ Ramping"
-    
-    # Build Slack message
-    payload = {
-        "blocks": [
-            {
-                "type": "header",
-                "text": {
-                    "type": "plain_text",
-                    "text": "📊 Claude Code Metrics",
-                    "emoji": True
-                }
-            },
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"*{repo_owner}/{repo_name}*\nWeek of {week_of}\n{status}"
-                }
-            },
-            {
-                "type": "divider"
-            },
-            {
-                "type": "section",
-                "fields": [
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Co-authored Code*\n{co_authored_percent}% ({co_authored_count}/{total_commits})"
-                    },
-                    {
-                        "type": "mrkdwn",
-                        "text": f"*Last Updated*\n{datetime.now().strftime('%Y-%m-%d %H:%M UTC')}"
-                    }
-                ]
-            }
-        ],
-        "attachments": [
-            {
-                "color": color,
-                "text": "Metrics collected from git history"
-            }
-        ]
-    }
-    
-    # Post to Slack
-    headers = {'Content-Type': 'application/json'}
-    response = requests.post(webhook_url, json=payload, headers=headers, timeout=10)
-    response.raise_for_status()
-    print(f"✅ Posted to Slack: {co_authored_percent}% co-authored ({co_authored_count}/{total_commits})")
-
-except Exception as e:
-    print(f"⚠️ Error: {e}")
-    exit(0)
-
-EOFPYTHON
+        run: |
+          python3 -c "
+          import json, os, subprocess, requests
+          from datetime import datetime, timedelta
+          
+          webhook = os.getenv('SLACK_WEBHOOK_URL')
+          owner = os.getenv('REPO_OWNER')
+          repo = os.getenv('REPO_NAME')
+          
+          # Count commits
+          co = subprocess.run(['git', 'log', '--since=7 days ago', '--grep=Co-authored-by: Claude', '--oneline'], capture_output=True, text=True).stdout.count('\n')
+          total = subprocess.run(['git', 'log', '--since=7 days ago', '--oneline'], capture_output=True, text=True).stdout.count('\n')
+          pct = round((co*100/total) if total > 0 else 0, 1)
+          
+          color = 'good' if pct >= 20 else 'warning' if pct >= 10 else 'danger'
+          status = '🎯 Excellent' if pct >= 20 else '📈 Good' if pct >= 10 else '⚠️ Ramping'
+          
+          msg = {
+            'blocks': [
+              {'type': 'header', 'text': {'type': 'plain_text', 'text': '📊 Claude Metrics'}},
+              {'type': 'section', 'text': {'type': 'mrkdwn', 'text': f'*{owner}/{repo}*\n{status}'}},
+              {'type': 'divider'},
+              {'type': 'section', 'fields': [
+                {'type': 'mrkdwn', 'text': f'*Co-authored*\n{pct}% ({co}/{total})'},
+                {'type': 'mrkdwn', 'text': f'*Updated*\n{datetime.now().strftime(\"%Y-%m-%d %H:%M UTC\")}'}
+              ]}
+            ],
+            'attachments': [{'color': color}]
+          }
+          
+          r = requests.post(webhook, json=msg)
+          print(f'✓ Posted: {pct}% ({co}/{total})')
+          "
