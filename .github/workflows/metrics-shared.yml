@@ -7,21 +7,18 @@ on:
         description: 'Slack webhook for posting metrics'
         required: true
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
   collect-metrics:
     runs-on: ubuntu-latest
     
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4.1.7
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
       
       - name: Set up Python
-        uses: actions/setup-python@v5.1.0
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       
@@ -105,7 +102,7 @@ jobs:
           bash collect_metrics.sh
       
       - name: Upload metrics artifact
-        uses: actions/upload-artifact@v4.3.5
+        uses: actions/upload-artifact@v4
         with:
           name: metrics-report
           path: metrics_*.json
