@@ -102,7 +102,7 @@ jobs:
           bash collect_metrics.sh
       
       - name: Upload metrics artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: metrics-report
           path: metrics_*.json
