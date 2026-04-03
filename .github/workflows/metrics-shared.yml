@@ -26,35 +26,81 @@ jobs:
           REPO_OWNER: ${{ github.repository_owner }}
           REPO_NAME: ${{ github.event.repository.name }}
         run: |
-          python3 -c "
+          python3 << 'EOFPYTHON'  
           import json, os, subprocess, requests
           from datetime import datetime, timedelta
+          from collections import defaultdict
           
           webhook = os.getenv('SLACK_WEBHOOK_URL')
           owner = os.getenv('REPO_OWNER')
           repo = os.getenv('REPO_NAME')
           
-          # Count commits
-          co = subprocess.run(['git', 'log', '--since=7 days ago', '--grep=Co-authored-by: Claude', '--oneline'], capture_output=True, text=True).stdout.count('\n')
-          total = subprocess.run(['git', 'log', '--since=7 days ago', '--oneline'], capture_output=True, text=True).stdout.count('\n')
-          pct = round((co*100/total) if total > 0 else 0, 1)
+          # Get all commits in last 7 days with authors
+          result = subprocess.run(
+              ['git', 'log', '--since=7 days ago', '--format=%an|||%B'],
+              capture_output=True, text=True
+          )
           
-          color = 'good' if pct >= 20 else 'warning' if pct >= 10 else 'danger'
-          status = '🎯 Excellent' if pct >= 20 else '📈 Good' if pct >= 10 else '⚠️ Ramping'
+          commits_by_author = defaultdict(lambda: {'total': 0, 'co_authored': 0})
+          all_commits = result.stdout.strip().split('\n')
+          
+          for commit in all_commits:
+              if '|||' not in commit:
+                  continue
+              author, message = commit.split('|||', 1)
+              author = author.strip()
+              
+              if not author or author in ['dependabot[bot]', 'github-actions[bot]']:
+                  continue
+              
+              commits_by_author[author]['total'] += 1
+              if 'Co-authored-by: Claude' in message:
+                  commits_by_author[author]['co_authored'] += 1
+          
+          # Calculate stats
+          total_commits = sum(a['total'] for a in commits_by_author.values())
+          total_co_authored = sum(a['co_authored'] for a in commits_by_author.values())
+          overall_pct = round((total_co_authored*100/total_commits) if total_commits > 0 else 0, 1)
+          
+          # Sort by co-authored percentage
+          sorted_authors = sorted(
+              commits_by_author.items(),
+              key=lambda x: (x[1]['co_authored'], x[1]['total']),
+              reverse=True
+          )
+          
+          # Status
+          color = 'good' if overall_pct >= 20 else 'warning' if overall_pct >= 10 else 'danger'
+          status = '🎯 Excellent' if overall_pct >= 20 else '📈 Good' if overall_pct >= 10 else '⚠️ Ramping'
+          
+          # Build engineer list
+          engineer_text = ""
+          for author, stats in sorted_authors[:10]:
+              pct = round((stats['co_authored']*100/stats['total']) if stats['total'] > 0 else 0, 1)
+              engineer_text += f"• *{author}*: {stats['co_authored']}/{stats['total']} commits ({pct}%)\n"
+          
+          if not engineer_text:
+              engineer_text = "No commits in past 7 days"
           
           msg = {
-            'blocks': [
-              {'type': 'header', 'text': {'type': 'plain_text', 'text': '📊 Claude Metrics'}},
-              {'type': 'section', 'text': {'type': 'mrkdwn', 'text': f'*{owner}/{repo}*\n{status}'}},
-              {'type': 'divider'},
-              {'type': 'section', 'fields': [
-                {'type': 'mrkdwn', 'text': f'*Co-authored*\n{pct}% ({co}/{total})'},
-                {'type': 'mrkdwn', 'text': f'*Updated*\n{datetime.now().strftime(\"%Y-%m-%d %H:%M UTC\")}'}
-              ]}
-            ],
-            'attachments': [{'color': color}]
+              'blocks': [
+                  {'type': 'header', 'text': {'type': 'plain_text', 'text': '📊 Claude Code Metrics'}},
+                  {'type': 'section', 'text': {'type': 'mrkdwn', 'text': f'*{owner}/{repo}*\n{status}'}},
+                  {'type': 'divider'},
+                  {'type': 'section', 'fields': [
+                      {'type': 'mrkdwn', 'text': f'*Overall Co-authored*\n{overall_pct}% ({total_co_authored}/{total_commits})'},
+                      {'type': 'mrkdwn', 'text': f'*Active Engineers*\n{len(commits_by_author)}'},
+                      {'type': 'mrkdwn', 'text': f'*Week of*\n{(datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")} to {datetime.now().strftime("%Y-%m-%d")}'},
+                      {'type': 'mrkdwn', 'text': f'*Updated*\n{datetime.now().strftime("%Y-%m-%d %H:%M UTC")}'}
+                  ]},
+                  {'type': 'divider'},
+                  {'type': 'section', 'text': {'type': 'mrkdwn', 'text': f'*Team Contribution*\n{engineer_text}'}}
+              ],
+              'attachments': [{'color': color}]
           }
           
           r = requests.post(webhook, json=msg)
-          print(f'✓ Posted: {pct}% ({co}/{total})')
-          "
+          print(f'✓ Posted: {overall_pct}% co-authored ({total_co_authored}/{total_commits})')
+          if sorted_authors:
+              print(f'✓ {len(commits_by_author)} engineers tracked')
+          EOFPYTHON
