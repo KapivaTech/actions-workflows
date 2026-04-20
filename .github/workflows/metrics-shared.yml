@@ -1,100 +1,138 @@
-name: Claude Code Metrics (Shared)
+name: Co-authored Commits Report
 
 on:
-  workflow_call:
-    secrets:
-      SLACK_WEBHOOK_URL:
-        required: true
+  workflow_dispatch:
 
 jobs:
-  metrics:
+  report:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      
-      - run: pip install requests
-      
-      - name: Collect and post metrics
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Generate report and send to Slack
         env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          REPO_OWNER: ${{ github.repository_owner }}
-          REPO_NAME: ${{ github.event.repository.name }}
-        run: python3 -c "
-          import json, os, subprocess, requests, re
-          from datetime import datetime, timedelta
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          python3 << 'EOF'
+          import subprocess
+          import requests
           from collections import defaultdict
+          import time
 
-          webhook = os.getenv('SLACK_WEBHOOK_URL')
-          owner = os.getenv('REPO_OWNER')
-          repo = os.getenv('REPO_NAME')
+          # Slack safe chunk size (max ~50 blocks)
+          CHUNK_SIZE = 45
 
-          result = subprocess.run(['git', 'log', '--since=7 days ago', '--format=%an|||%ae|||%H|||%B|||%ai|||%cN|||%cE'], capture_output=True, text=True)
-          engineers = defaultdict(lambda: {'email': '', 'total_commits': 0, 'co_authored_commits': 0, 'commits': [], 'dates': []})
+          # --- FETCH GIT LOG ---
+          try:
+              log = subprocess.check_output(
+                  ["git", "log", "--pretty=format:%H%x1f%an%x1f%ae%x1f%B"],
+                  text=True
+              )
+          except subprocess.CalledProcessError as e:
+              print("Git log failed:", e)
+              exit(1)
 
-          for commit in result.stdout.strip().split('\n'):
-              if '|||' not in commit:
+          commits = log.strip().split("\n") if log else []
+
+          engineers = defaultdict(lambda: {
+              "total_commits": 0,
+              "co_authored_commits": 0
+          })
+
+          total_commits = 0
+          total_co_authored = 0
+
+          # --- PARSE COMMITS ---
+          for entry in commits:
+              try:
+                  _, author, email, message = entry.split("\x1f", 3)
+              except ValueError:
                   continue
-              parts = commit.split('|||')
-              if len(parts) < 7:
-                  continue
-              author, author_email, commit_hash, message, date, committer_name, committer_email = parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3], parts[4].strip(), parts[5].strip(), parts[6].strip()
-              if not author or author in ['dependabot[bot]', 'github-actions[bot]']:
-                  continue
-              final_email = committer_email if ('noreply' in author_email and committer_email and 'noreply' not in committer_email) else (author_email if (author_email and 'noreply' not in author_email) else committer_email)
-              is_co_authored = bool(re.search(r'co-authored-by:\s*claude', message, re.IGNORECASE))
-              engineers[author]['email'] = final_email
-              engineers[author]['total_commits'] += 1
-              engineers[author]['commits'].append(commit_hash)
-              engineers[author]['dates'].append(date)
-              if is_co_authored:
-                  engineers[author]['co_authored_commits'] += 1
 
-          pr_result = subprocess.run(['git', 'log', '--since=7 days ago', '--format=%an|||%s', '--all'], capture_output=True, text=True)
-          prs_by_author = defaultdict(int)
-          for line in pr_result.stdout.strip().split('\n'):
-              if '|||' in line:
-                  author, subject = line.split('|||', 1)
-                  if 'Merge pull request' in subject or 'merge pull request' in subject.lower():
-                      prs_by_author[author.strip()] += 1
+              key = f"{author}|||{email}"
 
-          week_of = f\"{(datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')} to {datetime.now().strftime('%Y-%m-%d')}\"
-          sorted_engineers = sorted(engineers.items(), key=lambda x: x[1]['co_authored_commits'], reverse=True)
+              engineers[key]["total_commits"] += 1
+              total_commits += 1
 
-          blocks = [
-              {'type': 'header', 'text': {'type': 'plain_text', 'text': '📊 Claude Code Metrics Report'}},
-              {'type': 'section', 'text': {'type': 'mrkdwn', 'text': f'*{owner}/{repo}*\nWeek of {week_of}'}},
-              {'type': 'divider'}
-          ]
+              if "Co-authored-by:" in message:
+                  engineers[key]["co_authored_commits"] += 1
+                  total_co_authored += 1
 
-          for author, stats in sorted_engineers:
-              if stats['total_commits'] == 0:
-                  continue
-              co_auth_pct = round((stats['co_authored_commits'] * 100) / stats['total_commits'], 1)
-              prs = prs_by_author.get(author, 0)
-              adoption = '🔥 Expert' if co_auth_pct >= 80 else '⭐ Advanced' if co_auth_pct >= 60 else '📈 Proficient' if co_auth_pct >= 40 else '🌱 Learning' if co_auth_pct >= 20 else '👋 New'
-              email_display = 'GitHub: ' + author if 'noreply' in stats['email'].lower() else stats['email']
-              engineer_text = f'*{author}*\nEmail: {email_display}\nAdoption Level: {adoption}\n\n*Metrics:*\n• Total Commits: {stats[\"total_commits\"]}\n• Claude Co-authored: {stats[\"co_authored_commits\"]}/{stats[\"total_commits\"]} ({co_auth_pct}%)\n• PRs Merged: {prs}\n• Avg Commits/Day: {round(stats[\"total_commits\"] / 7, 1)}'
-              blocks.append({'type': 'section', 'text': {'type': 'mrkdwn', 'text': engineer_text}})
-              blocks.append({'type': 'divider'})
+          # --- SORT ENGINEERS ---
+          sorted_engineers = sorted(
+              engineers.items(),
+              key=lambda x: x[1]["co_authored_commits"],
+              reverse=True
+          )
 
-          total_commits = sum(s['total_commits'] for s in engineers.values())
-          total_co_authored = sum(s['co_authored_commits'] for s in engineers.values())
-          total_engineers = len([s for s in engineers.values() if s['total_commits'] > 0])
-          overall_pct = round((total_co_authored*100/total_commits) if total_commits > 0 else 0, 1)
-          color = 'good' if overall_pct >= 20 else 'warning' if overall_pct >= 10 else 'danger'
-          status = '🎯 Excellent' if overall_pct >= 20 else '📈 Good' if overall_pct >= 10 else '⚠️ Ramping'
+          webhook = "${SLACK_WEBHOOK}"
 
-          blocks.insert(2, {'type': 'section', 'fields': [{'type': 'mrkdwn', 'text': f'*Team Status*\n{status}'}, {'type': 'mrkdwn', 'text': f'*Overall Adoption*\n{overall_pct}%'}, {'type': 'mrkdwn', 'text': f'*Total Commits*\n{total_commits}'}, {'type': 'mrkdwn', 'text': f'*Active Engineers*\n{total_engineers}'}]})
-          blocks.insert(3, {'type': 'divider'})
+          if not webhook:
+              print("Missing Slack webhook")
+              exit(1)
 
-          msg = {'blocks': blocks, 'attachments': [{'color': color, 'text': f'Updated: {datetime.now().strftime(\"%Y-%m-%d %H:%M UTC\")}'}]}
-          r = requests.post(webhook, json=msg)
-          print(f'✓ Posted detailed report for {total_engineers} engineers')
-          print(f'✓ Team adoption: {overall_pct}% ({total_co_authored}/{total_commits})')
-          "
+          def send_to_slack(blocks):
+              for attempt in range(3):  # retry logic
+                  res = requests.post(webhook, json={"blocks": blocks})
+                  if res.status_code == 200:
+                      return
+                  print(f"Slack error (attempt {attempt+1}):", res.text)
+                  time.sleep(2)
+              exit(1)
+
+          overall_pct = round(
+              (total_co_authored * 100 / total_commits), 1
+          ) if total_commits > 0 else 0
+
+          # --- CHUNK + SEND ---
+          for i in range(0, len(sorted_engineers), CHUNK_SIZE):
+              chunk = sorted_engineers[i:i + CHUNK_SIZE]
+
+              blocks = []
+
+              # Header only in first message
+              if i == 0:
+                  blocks.append({
+                      "type": "section",
+                      "text": {
+                          "type": "mrkdwn",
+                          "text": f"*Co-authored Commits Report*\n\n"
+                                  f"Total Commits: {total_commits}\n"
+                                  f"Co-authored Commits: {total_co_authored} ({overall_pct}%)\n"
+                                  f"Total Engineers: {len(sorted_engineers)}"
+                      }
+                  })
+                  blocks.append({"type": "divider"})
+
+              for key, stats in chunk:
+                  author, email = key.split("|||")
+
+                  total = stats["total_commits"]
+                  co_auth = stats["co_authored_commits"]
+
+                  pct = round((co_auth * 100 / total), 1) if total > 0 else 0
+
+                  blocks.append({
+                      "type": "section",
+                      "text": {
+                          "type": "mrkdwn",
+                          "text": (
+                              f"*{author}*\n"
+                              f"Email: {email}\n"
+                              f"Total: {total} | Co-authored: {co_auth} ({pct}%)"
+                          )
+                      }
+                  })
+
+              send_to_slack(blocks)
+
+              # small delay to avoid rate limiting
+              time.sleep(1)
+
+          print("✅ Full report sent for ALL engineers")
+          EOF
