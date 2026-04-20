@@ -3,8 +3,8 @@ name: Co-authored Commits Report
 on:
   workflow_call:
     secrets:
-      SLACK_WEBHOOK:
-        required: true
+      SLACK_WEBHOOK_URL:
+        required: false
 
 jobs:
   report:
@@ -20,7 +20,7 @@ jobs:
       
       - name: Generate report and send to Slack
         env:
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           python3 << 'PYSCRIPT'
           import subprocess
@@ -28,21 +28,29 @@ jobs:
           from collections import defaultdict
           import time
           import re
+          import os
 
-          CHUNK_SIZE = 45
+          CHUNK_SIZE = 40
 
-          # Get all commits
-          log = subprocess.check_output(
-              ["git", "log", "--all", "--pretty=format:%H|||%an|||%ae|||%B"],
-              text=True
-          )
+          webhook = os.getenv('SLACK_WEBHOOK_URL', '')
+          if not webhook:
+              print("⚠️ SLACK_WEBHOOK_URL not set, skipping Slack post")
+              exit(0)
+
+          try:
+              log = subprocess.check_output(
+                  ["git", "log", "--all", "--pretty=format:%H|||%an|||%ae|||%B"],
+                  text=True
+              )
+          except:
+              print("Error fetching git log")
+              exit(1)
 
           commits = [c for c in log.strip().split("\n") if c]
           engineers = defaultdict(lambda: {"total": 0, "co_authored": 0})
           total_commits = 0
           total_co_authored = 0
 
-          # Parse commits
           for entry in commits:
               parts = entry.split("|||", 3)
               if len(parts) < 4:
@@ -58,58 +66,113 @@ jobs:
                   engineers[key]["co_authored"] += 1
                   total_co_authored += 1
 
-          # Sort by co-authored
+          if not engineers:
+              print("No commits found")
+              exit(0)
+
           sorted_eng = sorted(
               engineers.items(),
               key=lambda x: x[1]["co_authored"],
               reverse=True
           )
 
-          webhook = "${SLACK_WEBHOOK}"
-          if not webhook:
-              print("ERROR: Missing SLACK_WEBHOOK")
-              exit(1)
+          def get_adoption_level(pct):
+              if pct >= 80:
+                  return "🔥 Expert"
+              elif pct >= 60:
+                  return "⭐ Advanced"
+              elif pct >= 40:
+                  return "📈 Proficient"
+              elif pct >= 20:
+                  return "🌱 Learning"
+              else:
+                  return "👋 New"
 
           def send_slack(blocks):
-              resp = requests.post(webhook, json={"blocks": blocks})
-              if resp.status_code != 200:
-                  print(f"Slack error: {resp.text}")
+              try:
+                  resp = requests.post(webhook, json={"blocks": blocks}, timeout=10)
+                  return resp.status_code == 200
+              except Exception as e:
+                  print(f"Slack error: {e}")
                   return False
-              return True
 
           overall_pct = round((total_co_authored * 100 / total_commits), 1) if total_commits > 0 else 0
+          
+          # Determine team status
+          if overall_pct >= 20:
+              team_status = "🎯 Excellent"
+              color = "good"
+          elif overall_pct >= 10:
+              team_status = "📈 Good"
+              color = "warning"
+          else:
+              team_status = "⚠️ Ramping"
+              color = "danger"
 
-          # Send in chunks
           for i in range(0, len(sorted_eng), CHUNK_SIZE):
               chunk = sorted_eng[i:i + CHUNK_SIZE]
               blocks = []
 
               if i == 0:
                   blocks.append({
-                      "type": "section",
+                      "type": "header",
                       "text": {
-                          "type": "mrkdwn",
-                          "text": f"*Claude Code Adoption Report*\n\nTotal Commits: {total_commits}\nCo-authored: {total_co_authored} ({overall_pct}%)\nEngineers: {len(sorted_eng)}"
+                          "type": "plain_text",
+                          "text": "📊 Claude Code Adoption Report"
                       }
                   })
+                  
+                  blocks.append({
+                      "type": "section",
+                      "fields": [
+                          {
+                              "type": "mrkdwn",
+                              "text": f"*Team Status*\n{team_status}"
+                          },
+                          {
+                              "type": "mrkdwn",
+                              "text": f"*Overall Adoption*\n{overall_pct}%"
+                          },
+                          {
+                              "type": "mrkdwn",
+                              "text": f"*Total Commits*\n{total_commits}"
+                          },
+                          {
+                              "type": "mrkdwn",
+                              "text": f"*Active Engineers*\n{len(sorted_eng)}"
+                          }
+                      ]
+                  })
+                  
                   blocks.append({"type": "divider"})
 
               for key, stats in chunk:
                   author, email = key.split("|||")
                   pct = round((stats["co_authored"] * 100 / stats["total"]), 1) if stats["total"] > 0 else 0
+                  adoption_level = get_adoption_level(pct)
                   
                   blocks.append({
                       "type": "section",
                       "text": {
                           "type": "mrkdwn",
-                          "text": f"*{author}*\nEmail: {email}\nTotal: {stats['total']} | Co-authored: {stats['co_authored']} ({pct}%)"
+                          "text": f"*{author}*\n{adoption_level}\nEmail: {email}\n• Total: {stats['total']} | Co-authored: {stats['co_authored']} ({pct}%)"
                       }
                   })
 
+              blocks.append({
+                  "type": "context",
+                  "elements": [
+                      {
+                          "type": "mrkdwn",
+                          "text": f"Updated: {__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M UTC')}"
+                      }
+                  ]
+              })
+
               if not send_slack(blocks):
-                  exit(1)
+                  print(f"Failed to post chunk {i//CHUNK_SIZE + 1}")
               
               time.sleep(0.5)
 
-          print("✅ Report sent successfully")
+          print(f"✅ Report sent: {len(sorted_eng)} engineers, {overall_pct}% adoption, {team_status}")
           PYSCRIPT
