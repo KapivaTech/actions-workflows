@@ -2,137 +2,114 @@ name: Co-authored Commits Report
 
 on:
   workflow_call:
+    secrets:
+      SLACK_WEBHOOK:
+        required: true
 
 jobs:
   report:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-
+        with:
+          fetch-depth: 0
+      
       - name: Install dependencies
         run: pip install requests
-
+      
       - name: Generate report and send to Slack
         env:
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
         run: |
-          python3 << 'EOF'
+          python3 << 'PYSCRIPT'
           import subprocess
           import requests
           from collections import defaultdict
           import time
+          import re
 
-          # Slack safe chunk size (max ~50 blocks)
           CHUNK_SIZE = 45
 
-          # --- FETCH GIT LOG ---
-          try:
-              log = subprocess.check_output(
-                  ["git", "log", "--pretty=format:%H%x1f%an%x1f%ae%x1f%B"],
-                  text=True
-              )
-          except subprocess.CalledProcessError as e:
-              print("Git log failed:", e)
-              exit(1)
+          # Get all commits
+          log = subprocess.check_output(
+              ["git", "log", "--all", "--pretty=format:%H|||%an|||%ae|||%B"],
+              text=True
+          )
 
-          commits = log.strip().split("\n") if log else []
-
-          engineers = defaultdict(lambda: {
-              "total_commits": 0,
-              "co_authored_commits": 0
-          })
-
+          commits = [c for c in log.strip().split("\n") if c]
+          engineers = defaultdict(lambda: {"total": 0, "co_authored": 0})
           total_commits = 0
           total_co_authored = 0
 
-          # --- PARSE COMMITS ---
+          # Parse commits
           for entry in commits:
-              try:
-                  _, author, email, message = entry.split("\x1f", 3)
-              except ValueError:
+              parts = entry.split("|||", 3)
+              if len(parts) < 4:
                   continue
-
+              
+              _, author, email, message = parts
               key = f"{author}|||{email}"
-
-              engineers[key]["total_commits"] += 1
+              
+              engineers[key]["total"] += 1
               total_commits += 1
-
-              if "Co-authored-by:" in message:
-                  engineers[key]["co_authored_commits"] += 1
+              
+              if re.search(r"co-authored-by:\s*", message, re.IGNORECASE):
+                  engineers[key]["co_authored"] += 1
                   total_co_authored += 1
 
-          # --- SORT ENGINEERS ---
-          sorted_engineers = sorted(
+          # Sort by co-authored
+          sorted_eng = sorted(
               engineers.items(),
-              key=lambda x: x[1]["co_authored_commits"],
+              key=lambda x: x[1]["co_authored"],
               reverse=True
           )
 
           webhook = "${SLACK_WEBHOOK}"
-
           if not webhook:
-              print("Missing Slack webhook")
+              print("ERROR: Missing SLACK_WEBHOOK")
               exit(1)
 
-          def send_to_slack(blocks):
-              for attempt in range(3):  # retry logic
-                  res = requests.post(webhook, json={"blocks": blocks})
-                  if res.status_code == 200:
-                      return
-                  print(f"Slack error (attempt {attempt+1}):", res.text)
-                  time.sleep(2)
-              exit(1)
+          def send_slack(blocks):
+              resp = requests.post(webhook, json={"blocks": blocks})
+              if resp.status_code != 200:
+                  print(f"Slack error: {resp.text}")
+                  return False
+              return True
 
-          overall_pct = round(
-              (total_co_authored * 100 / total_commits), 1
-          ) if total_commits > 0 else 0
+          overall_pct = round((total_co_authored * 100 / total_commits), 1) if total_commits > 0 else 0
 
-          # --- CHUNK + SEND ---
-          for i in range(0, len(sorted_engineers), CHUNK_SIZE):
-              chunk = sorted_engineers[i:i + CHUNK_SIZE]
-
+          # Send in chunks
+          for i in range(0, len(sorted_eng), CHUNK_SIZE):
+              chunk = sorted_eng[i:i + CHUNK_SIZE]
               blocks = []
 
-              # Header only in first message
               if i == 0:
                   blocks.append({
                       "type": "section",
                       "text": {
                           "type": "mrkdwn",
-                          "text": f"*Co-authored Commits Report*\n\n"
-                                  f"Total Commits: {total_commits}\n"
-                                  f"Co-authored Commits: {total_co_authored} ({overall_pct}%)\n"
-                                  f"Total Engineers: {len(sorted_engineers)}"
+                          "text": f"*Claude Code Adoption Report*\n\nTotal Commits: {total_commits}\nCo-authored: {total_co_authored} ({overall_pct}%)\nEngineers: {len(sorted_eng)}"
                       }
                   })
                   blocks.append({"type": "divider"})
 
               for key, stats in chunk:
                   author, email = key.split("|||")
-
-                  total = stats["total_commits"]
-                  co_auth = stats["co_authored_commits"]
-
-                  pct = round((co_auth * 100 / total), 1) if total > 0 else 0
-
+                  pct = round((stats["co_authored"] * 100 / stats["total"]), 1) if stats["total"] > 0 else 0
+                  
                   blocks.append({
                       "type": "section",
                       "text": {
                           "type": "mrkdwn",
-                          "text": (
-                              f"*{author}*\n"
-                              f"Email: {email}\n"
-                              f"Total: {total} | Co-authored: {co_auth} ({pct}%)"
-                          )
+                          "text": f"*{author}*\nEmail: {email}\nTotal: {stats['total']} | Co-authored: {stats['co_authored']} ({pct}%)"
                       }
                   })
 
-              send_to_slack(blocks)
+              if not send_slack(blocks):
+                  exit(1)
+              
+              time.sleep(0.5)
 
-              # small delay to avoid rate limiting
-              time.sleep(1)
-
-          print("✅ Full report sent for ALL engineers")
-          EOF
+          print("✅ Report sent successfully")
+          PYSCRIPT
