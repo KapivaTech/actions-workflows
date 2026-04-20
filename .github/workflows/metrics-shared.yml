@@ -29,63 +29,85 @@ jobs:
           import time
 
           CHUNK_SIZE = 40
+          DAYS = 7
           webhook = os.getenv('SLACK_WEBHOOK_URL', '')
           if not webhook:
               print("SLACK_WEBHOOK_URL not set")
               exit(0)
 
-          # Use null byte as commit separator to handle multi-line commit bodies
+          # Only last 7 days, null byte separator for multi-line body
           raw = subprocess.check_output(
-              ["git", "log", "--all", "--format=%x00%an%x01%ae%x01%B"],
+              ["git", "log", "--all", f"--since={DAYS} days ago", "--format=%x00%an%x01%ae%x01%B"],
               text=True
           )
 
-          engineers = defaultdict(lambda: {"total": 0, "co_authored": 0, "email": "", "dates": []})
-          total_commits = 0
-          total_co_authored = 0
-
-          # Get PR merges per author
           pr_raw = subprocess.check_output(
-              ["git", "log", "--all", "--format=%x00%an%x01%s"],
+              ["git", "log", "--all", f"--since={DAYS} days ago", "--format=%x00%an%x01%ae%x01%s"],
               text=True
           )
-          prs_by_author = defaultdict(int)
-          for entry in pr_raw.split("\x00"):
-              entry = entry.strip()
-              if not entry:
-                  continue
-              parts = entry.split("\x01", 1)
-              if len(parts) < 2:
-                  continue
-              author, subject = parts[0].strip(), parts[1].strip()
-              if "merge pull request" in subject.lower():
-                  prs_by_author[author] += 1
+
+          # email -> canonical name + stats
+          # We deduplicate by using the FIRST real email seen as the key
+          # and map all aliases to it
+          email_to_name = {}
+          email_stats = defaultdict(lambda: {"total": 0, "co_authored": 0, "prs": 0})
+
+          SKIP = ['dependabot[bot]', 'github-actions[bot]', 'coderabbitai[bot]', 'cursor']
+
+          def canonical_email(email):
+              # noreply emails are unreliable - treat as unknown
+              if "noreply" in email or "localhost" in email or ".local" in email or ".lan" in email:
+                  return None
+              return email.lower().strip()
 
           # Parse commits
           for entry in raw.split("\x00"):
               entry = entry.strip()
               if not entry:
                   continue
-
               parts = entry.split("\x01", 2)
               if len(parts) < 3:
                   continue
-
               author, email, body = parts[0].strip(), parts[1].strip(), parts[2]
-
-              skip = ['dependabot[bot]', 'github-actions[bot]', 'coderabbitai[bot]']
-              if not author or any(s in author for s in skip):
+              if not author or any(s.lower() in author.lower() for s in SKIP):
                   continue
 
-              engineers[author]["total"] += 1
-              engineers[author]["email"] = email
-              total_commits += 1
+              key = canonical_email(email)
+              if not key:
+                  # Fall back to author name as key for noreply users
+                  key = f"__name__{author.lower()}"
+
+              if key not in email_to_name:
+                  email_to_name[key] = {"name": author, "email": email}
+
+              email_stats[key]["total"] += 1
 
               if re.search(r"co-authored-by", body, re.IGNORECASE):
-                  engineers[author]["co_authored"] += 1
-                  total_co_authored += 1
+                  email_stats[key]["co_authored"] += 1
 
-          sorted_eng = sorted(engineers.items(), key=lambda x: x[1]["co_authored"], reverse=True)
+          # Parse PRs
+          for entry in pr_raw.split("\x00"):
+              entry = entry.strip()
+              if not entry:
+                  continue
+              parts = entry.split("\x01", 2)
+              if len(parts) < 3:
+                  continue
+              author, email, subject = parts[0].strip(), parts[1].strip(), parts[2].strip()
+              if not author or any(s.lower() in author.lower() for s in SKIP):
+                  continue
+
+              key = canonical_email(email)
+              if not key:
+                  key = f"__name__{author.lower()}"
+
+              if "merge pull request" in subject.lower():
+                  email_stats[key]["prs"] += 1
+
+          total_commits = sum(s["total"] for s in email_stats.values())
+          total_co_authored = sum(s["co_authored"] for s in email_stats.values())
+
+          sorted_eng = sorted(email_stats.items(), key=lambda x: x[1]["co_authored"], reverse=True)
 
           def level(pct):
               if pct >= 80: return "🔥 Expert"
@@ -100,6 +122,7 @@ jobs:
 
           overall_pct = round(total_co_authored * 100 / total_commits, 1) if total_commits else 0
           team_status = "🎯 Excellent" if overall_pct >= 20 else "📈 Good" if overall_pct >= 10 else "⚠️ Ramping"
+          week_of = f"{datetime.now().strftime('%Y-%m-%d')} (last {DAYS} days)"
 
           for i in range(0, len(sorted_eng), CHUNK_SIZE):
               chunk = sorted_eng[i:i + CHUNK_SIZE]
@@ -116,14 +139,17 @@ jobs:
                           {"type": "mrkdwn", "text": f"*Active Engineers*\n{len(sorted_eng)}"}
                       ]
                   })
+                  blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"📅 {week_of}"}]})
                   blocks.append({"type": "divider"})
 
-              for author, stats in chunk:
+              for key, stats in chunk:
+                  info = email_to_name.get(key, {"name": key, "email": ""})
+                  name = info["name"]
+                  email = info["email"] if ("noreply" not in info["email"] and ".local" not in info["email"] and ".lan" not in info["email"]) else ""
+                  
                   pct = round(stats["co_authored"] * 100 / stats["total"], 1) if stats["total"] else 0
                   adoption = level(pct)
-                  email = stats["email"] if "noreply" not in stats["email"] else f"GitHub: {author}"
-                  prs = prs_by_author.get(author, 0)
-                  avg_per_day = round(stats["total"] / 7, 1)
+                  avg_per_day = round(stats["total"] / DAYS, 1)
                   co_auth_str = f"{stats['co_authored']}/{stats['total']} ({pct}%)"
 
                   blocks.append({
@@ -131,13 +157,13 @@ jobs:
                       "text": {
                           "type": "mrkdwn",
                           "text": (
-                              f"*{author}*\n"
-                              f"Email: {email}\n"
+                              f"*{name}*\n"
+                              f"Email: {email or 'N/A'}\n"
                               f"Adoption Level: {adoption}\n"
                               f"*Metrics:*\n"
                               f"• Total Commits: {stats['total']}\n"
                               f"• Claude Co-authored: {co_auth_str}\n"
-                              f"• PRs Merged: {prs}\n"
+                              f"• PRs Merged: {stats['prs']}\n"
                               f"• Avg Commits/Day: {avg_per_day}"
                           )
                       }
