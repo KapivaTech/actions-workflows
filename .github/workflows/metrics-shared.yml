@@ -18,6 +18,15 @@ jobs:
       - name: Install dependencies
         run: pip install requests
       
+      - name: Debug - Check commit formats
+        run: |
+          echo "=== Sample commits with Claude ==="
+          git log --all --pretty=format:"%B" | grep -i "claude" | head -5
+          echo ""
+          echo "=== Count matches ==="
+          echo "Pattern 'co-authored-by':"
+          git log --all --pretty=format:"%B" | grep -c -i "co-authored-by" || echo "0"
+      
       - name: Generate report and send to Slack
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
@@ -50,6 +59,9 @@ jobs:
           engineers = defaultdict(lambda: {"total": 0, "co_authored": 0})
           total_commits = 0
           total_co_authored = 0
+          
+          # Debug
+          sample_matches = []
 
           for entry in commits:
               parts = entry.split("|||", 3)
@@ -62,9 +74,27 @@ jobs:
               engineers[key]["total"] += 1
               total_commits += 1
               
-              if re.search(r"co-authored-by:\s*", message, re.IGNORECASE):
+              # Try multiple patterns
+              has_coauth = (
+                  "co-authored-by:" in message.lower() or 
+                  "co-authored-by" in message.lower() or
+                  "coauthored" in message.lower()
+              )
+              
+              if has_coauth:
                   engineers[key]["co_authored"] += 1
                   total_co_authored += 1
+                  if len(sample_matches) < 3:
+                      sample_matches.append((author, message[:100]))
+
+          print(f"\n✅ Total commits: {total_commits}")
+          print(f"✅ Co-authored commits: {total_co_authored}")
+          print(f"✅ Adoption: {round((total_co_authored*100/total_commits), 1) if total_commits > 0 else 0}%")
+          
+          if sample_matches:
+              print(f"\n✅ Sample co-authored commits:")
+              for author, msg in sample_matches:
+                  print(f"   - {author}: {msg[:80]}")
 
           if not engineers:
               print("No commits found")
@@ -98,7 +128,6 @@ jobs:
 
           overall_pct = round((total_co_authored * 100 / total_commits), 1) if total_commits > 0 else 0
           
-          # Determine team status
           if overall_pct >= 20:
               team_status = "🎯 Excellent"
               color = "good"
@@ -174,5 +203,5 @@ jobs:
               
               time.sleep(0.5)
 
-          print(f"✅ Report sent: {len(sorted_eng)} engineers, {overall_pct}% adoption, {team_status}")
+          print(f"\n✅ Report sent: {len(sorted_eng)} engineers, {overall_pct}% adoption")
           PYSCRIPT
