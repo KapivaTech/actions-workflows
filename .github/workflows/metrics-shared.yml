@@ -14,194 +14,111 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      
+
       - name: Install dependencies
         run: pip install requests
-      
-      - name: Debug - Check commit formats
-        run: |
-          echo "=== Sample commits with Claude ==="
-          git log --all --pretty=format:"%B" | grep -i "claude" | head -5
-          echo ""
-          echo "=== Count matches ==="
-          echo "Pattern 'co-authored-by':"
-          git log --all --pretty=format:"%B" | grep -c -i "co-authored-by" || echo "0"
-      
+
       - name: Generate report and send to Slack
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           python3 << 'PYSCRIPT'
-          import subprocess
-          import requests
+          import subprocess, requests, os, re
           from collections import defaultdict
+          from datetime import datetime
           import time
-          import re
-          import os
 
           CHUNK_SIZE = 40
-
           webhook = os.getenv('SLACK_WEBHOOK_URL', '')
           if not webhook:
-              print("⚠️ SLACK_WEBHOOK_URL not set, skipping Slack post")
+              print("SLACK_WEBHOOK_URL not set")
               exit(0)
 
-          try:
-              log = subprocess.check_output(
-                  ["git", "log", "--all", "--pretty=format:%H|||%an|||%ae|||%B"],
-                  text=True
-              )
-          except:
-              print("Error fetching git log")
-              exit(1)
-
-          commits = [c for c in log.strip().split("\n") if c]
-          engineers = defaultdict(lambda: {"total": 0, "co_authored": 0})
-          total_commits = 0
-          total_co_authored = 0
-          
-          # Debug
-          sample_matches = []
-
-          for entry in commits:
-              parts = entry.split("|||", 3)
-              if len(parts) < 4:
-                  continue
-              
-              _, author, email, message = parts
-              key = f"{author}|||{email}"
-              
-              engineers[key]["total"] += 1
-              total_commits += 1
-              
-              # Try multiple patterns
-              has_coauth = (
-                  "co-authored-by:" in message.lower() or 
-                  "co-authored-by" in message.lower() or
-                  "coauthored" in message.lower()
-              )
-              
-              if has_coauth:
-                  engineers[key]["co_authored"] += 1
-                  total_co_authored += 1
-                  if len(sample_matches) < 3:
-                      sample_matches.append((author, message[:100]))
-
-          print(f"\n✅ Total commits: {total_commits}")
-          print(f"✅ Co-authored commits: {total_co_authored}")
-          print(f"✅ Adoption: {round((total_co_authored*100/total_commits), 1) if total_commits > 0 else 0}%")
-          
-          if sample_matches:
-              print(f"\n✅ Sample co-authored commits:")
-              for author, msg in sample_matches:
-                  print(f"   - {author}: {msg[:80]}")
-
-          if not engineers:
-              print("No commits found")
-              exit(0)
-
-          sorted_eng = sorted(
-              engineers.items(),
-              key=lambda x: x[1]["co_authored"],
-              reverse=True
+          # Use --format with a commit-level separator (ASCII unit separator)
+          # %x00 = null byte between commits so newlines inside %B don't break parsing
+          raw = subprocess.check_output(
+              ["git", "log", "--all", "--format=%x00%an%x01%ae%x01%B"],
+              text=True
           )
 
-          def get_adoption_level(pct):
-              if pct >= 80:
-                  return "🔥 Expert"
-              elif pct >= 60:
-                  return "⭐ Advanced"
-              elif pct >= 40:
-                  return "📈 Proficient"
-              elif pct >= 20:
-                  return "🌱 Learning"
-              else:
-                  return "👋 New"
+          engineers = defaultdict(lambda: {"total": 0, "co_authored": 0, "email": ""})
+          total_commits = 0
+          total_co_authored = 0
 
-          def send_slack(blocks):
-              try:
-                  resp = requests.post(webhook, json={"blocks": blocks}, timeout=10)
-                  return resp.status_code == 200
-              except Exception as e:
-                  print(f"Slack error: {e}")
-                  return False
+          # Split on null byte — one entry per commit
+          for entry in raw.split("\x00"):
+              entry = entry.strip()
+              if not entry:
+                  continue
 
-          overall_pct = round((total_co_authored * 100 / total_commits), 1) if total_commits > 0 else 0
-          
-          if overall_pct >= 20:
-              team_status = "🎯 Excellent"
-              color = "good"
-          elif overall_pct >= 10:
-              team_status = "📈 Good"
-              color = "warning"
-          else:
-              team_status = "⚠️ Ramping"
-              color = "danger"
+              parts = entry.split("\x01", 2)
+              if len(parts) < 3:
+                  continue
+
+              author, email, body = parts[0].strip(), parts[1].strip(), parts[2]
+
+              skip = ['dependabot[bot]', 'github-actions[bot]', 'coderabbitai[bot]']
+              if not author or any(s in author for s in skip):
+                  continue
+
+              engineers[author]["total"] += 1
+              engineers[author]["email"] = email
+              total_commits += 1
+
+              if re.search(r"co-authored-by", body, re.IGNORECASE):
+                  engineers[author]["co_authored"] += 1
+                  total_co_authored += 1
+
+          print(f"Total commits: {total_commits}")
+          print(f"Co-authored: {total_co_authored}")
+
+          sorted_eng = sorted(engineers.items(), key=lambda x: x[1]["co_authored"], reverse=True)
+
+          def level(pct):
+              if pct >= 80: return "🔥 Expert"
+              if pct >= 60: return "⭐ Advanced"
+              if pct >= 40: return "📈 Proficient"
+              if pct >= 20: return "🌱 Learning"
+              return "👋 New"
+
+          def send(blocks):
+              r = requests.post(webhook, json={"blocks": blocks}, timeout=10)
+              return r.status_code == 200
+
+          overall_pct = round(total_co_authored * 100 / total_commits, 1) if total_commits else 0
+          team_status = "🎯 Excellent" if overall_pct >= 20 else "📈 Good" if overall_pct >= 10 else "⚠️ Ramping"
 
           for i in range(0, len(sorted_eng), CHUNK_SIZE):
               chunk = sorted_eng[i:i + CHUNK_SIZE]
               blocks = []
 
               if i == 0:
-                  blocks.append({
-                      "type": "header",
-                      "text": {
-                          "type": "plain_text",
-                          "text": "📊 Claude Code Adoption Report"
-                      }
-                  })
-                  
+                  blocks.append({"type": "header", "text": {"type": "plain_text", "text": "📊 Claude Code Adoption Report"}})
                   blocks.append({
                       "type": "section",
                       "fields": [
-                          {
-                              "type": "mrkdwn",
-                              "text": f"*Team Status*\n{team_status}"
-                          },
-                          {
-                              "type": "mrkdwn",
-                              "text": f"*Overall Adoption*\n{overall_pct}%"
-                          },
-                          {
-                              "type": "mrkdwn",
-                              "text": f"*Total Commits*\n{total_commits}"
-                          },
-                          {
-                              "type": "mrkdwn",
-                              "text": f"*Active Engineers*\n{len(sorted_eng)}"
-                          }
+                          {"type": "mrkdwn", "text": f"*Team Status*\n{team_status}"},
+                          {"type": "mrkdwn", "text": f"*Overall Adoption*\n{overall_pct}%"},
+                          {"type": "mrkdwn", "text": f"*Total Commits*\n{total_commits}"},
+                          {"type": "mrkdwn", "text": f"*Active Engineers*\n{len(sorted_eng)}"}
                       ]
                   })
-                  
                   blocks.append({"type": "divider"})
 
-              for key, stats in chunk:
-                  author, email = key.split("|||")
-                  pct = round((stats["co_authored"] * 100 / stats["total"]), 1) if stats["total"] > 0 else 0
-                  adoption_level = get_adoption_level(pct)
-                  
+              for author, stats in chunk:
+                  pct = round(stats["co_authored"] * 100 / stats["total"], 1) if stats["total"] else 0
+                  email = stats["email"] if "noreply" not in stats["email"] else f"GitHub: {author}"
                   blocks.append({
                       "type": "section",
                       "text": {
                           "type": "mrkdwn",
-                          "text": f"*{author}*\n{adoption_level}\nEmail: {email}\n• Total: {stats['total']} | Co-authored: {stats['co_authored']} ({pct}%)"
+                          "text": f"*{author}*\n{level(pct)}\n{email}\n• Total: {stats['total']} | Co-authored: {stats['co_authored']} ({pct}%)"
                       }
                   })
 
-              blocks.append({
-                  "type": "context",
-                  "elements": [
-                      {
-                          "type": "mrkdwn",
-                          "text": f"Updated: {__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M UTC')}"
-                      }
-                  ]
-              })
-
-              if not send_slack(blocks):
-                  print(f"Failed to post chunk {i//CHUNK_SIZE + 1}")
-              
+              blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"Updated: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}"}]})
+              send(blocks)
               time.sleep(0.5)
 
-          print(f"\n✅ Report sent: {len(sorted_eng)} engineers, {overall_pct}% adoption")
+          print(f"✅ Done: {len(sorted_eng)} engineers, {overall_pct}% adoption")
           PYSCRIPT
